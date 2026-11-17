@@ -1,46 +1,44 @@
-"""Deep-dip bounce bot for the make.fun cbBTC bars-replay race
+"""Deep-dip bounce bot v2 for the make.fun cbBTC bars-replay race
 (agent-fun/bars-replay/v1).
 
-Strategy (long only, at most one position, paper USDC) — a fresh design,
-no RSI, no divergence, no moving averages:
-  * Watch each 1-minute bar of CBBTC. A buy is considered only when the
-    latest close sits at least DIP_BPS below the trailing HIGH_WIN-bar
-    high of bar highs — a sharp one-hour washout, not a slow grind — AND
-    the latest bar bounced (its close is above the previous close), so
-    the fall is already exhausting instead of still accelerating.
+Strategy (long only, at most one position, paper USDC):
+  * Watch each 1-minute bar of CBBTC. A buy is considered only when
+    the latest close sits at least DIP_BPS below the trailing
+    HIGH_WIN-bar high of bar highs — a sharp one-hour washout, not a
+    slow grind — AND the latest bar bounced (its close is above the
+    previous close), so the fall is already exhausting instead of
+    still accelerating, AND Wilder RSI(14) at that bar is at or below
+    RSI_MAX, so the washout's momentum is genuinely oversold rather
+    than merely falling.
   * Entries are all-in (SIZE_PCT of cash). At most one round trip is
     open at a time; a COOLDOWN of bars follows every exit.
   * While holding, sell everything when the close has fallen SL_BPS
     below the entry bar's close (the bounce failed and the washout is
     resuming), or when TIME_STOP bars have passed since the entry bar
     (the bounce is given a fixed window to play out, then banked).
-  * Every order carries max_slippage_bps 10000 (the lab measurement the
-    bot was tuned on assumed fills are never refused for slippage).
+  * Every order carries max_slippage_bps 10000 (the lab measurement
+    the bot was tuned on assumed fills are never refused for
+    slippage).
 
-Why this shape: on the kit's dev window (a flat, range-bound day,
-+53 bps open to close, with one sharp washout to ~$63,874 and a
-recovery to ~$65,461) every trend, breakout, regime and short-horizon
-mean-reversion family tested lost money after the harness's fees,
-slippage and price impact — the only configurations that made money
-were the ones that waited for a rare, deep, already-bouncing dip and
-then held it for hours. The chosen parameters buy exactly one such
-dip on the dev window (bars 564 -> 984) and sit out the rest.
-
-Tuned on the kit's dev window with a fill-faithful simulator (see
-README): the parameters sit mid-plateau — dip 200-220 bps, time stop
-300-420 bars and stop 60-90 bps all score +$8 to +$15 on dev — and the
-same configuration is net-positive across eight additional real
-24-hour BTC windows (a -13.7% crash week): +$31 total, worst window
--$9.49. Looser dip thresholds and two-tier variants were tested and
-rejected: they catch falling knives on crash days and lose money
-there, while the deep threshold never lost more than ~$13 on any
-tested window. Verified on the shipped bot itself (in-process and
-twice over stdio, byte-identical action logs): dev net PnL +$14.65,
-2 trades, 1 round trip, max drawdown 0.62%.
+Why the RSI gate (v2, added 2026-11-17): measured on the official
+fill model across ten 24-hour windows (this kit's dev window, the
+previous race kit's real pool tape of Nov 14-15, and eight Binance
+days, Nov 9-16), v1 netted +$25.17 in total with a worst window of
+-$20.29. The RSI gate leaves the dev trade untouched (dev still
++$14.65) and raises the ten-window total to +$71.39 with the worst
+window at -$9.49: on the Nov 14 pool tape, v1's two losing entries
+were taken while RSI was still above 35 — falling, but not yet
+washed out — and the gate filters exactly those, turning that
+window from -$20.29 into +$21.88. Neighbouring thresholds are
+weaker (RSI 32: +$45.35; RSI 38: +$29.22), and combining the gate
+with a wider stop destroys the gain (+$28.09), so v2 changes this
+one thing only. The sample is small (8 round trips); no edge is
+proven — this is the best-measured configuration, stated plainly.
 
 Deterministic: no wall clock, no randomness, no environment reads;
-the only inputs are the hello and the batches themselves. All
-arithmetic is integer, identical every run.
+the only inputs are the hello and the batches themselves. Entry and
+exit arithmetic is integer; the RSI uses float Wilder smoothing,
+identical on every run given the same bars.
 """
 
 import os
@@ -55,6 +53,7 @@ SYMBOL = "CBBTC"
 PARAMS = {
     "high_win": 60,      # trailing window (bars) for the reference high
     "dip_bps": 220,      # close must be >= this far below the trailing high
+    "rsi_max": 35.0,     # Wilder RSI(14) at entry must be <= this
     "sl_bps": 60,        # stop: close this far below the entry close
     "time_stop": 420,    # max bars to hold a position (7 hours)
     "cooldown": 15,      # bars to wait after an exit before re-entering
@@ -75,6 +74,9 @@ class Bot:
         self.min_notional = int(hello["fees"]["min_notional_quote_units"])
         self.closes = []          # close of every bar seen, in order
         self.highs = []           # high of every bar seen, in order
+        self.avg_gain = None      # Wilder RSI(14) state
+        self.avg_loss = None
+        self.rsi = None
         self.entry_price = 0      # close of the bar that decided the open buy
         self.entry_seq = -1       # bar index that decided the open buy
         self.last_exit = -10 ** 9  # bar index of the last sell decision
@@ -85,11 +87,34 @@ class Bot:
         self.order_n += 1
         return "%s%d" % (tag, self.order_n)
 
+    def _feed_rsi(self):
+        j = len(self.closes) - 1
+        if j < 1:
+            return
+        chg = self.closes[j] - self.closes[j - 1]
+        g, lo = max(chg, 0), max(-chg, 0)
+        if self.avg_gain is None:
+            if j >= 14:
+                gains = [max(self.closes[k] - self.closes[k - 1], 0) for k in range(j - 13, j + 1)]
+                losses = [max(self.closes[k - 1] - self.closes[k], 0) for k in range(j - 13, j + 1)]
+                self.avg_gain = sum(gains) / 14.0
+                self.avg_loss = sum(losses) / 14.0
+        else:
+            self.avg_gain = (self.avg_gain * 13 + g) / 14.0
+            self.avg_loss = (self.avg_loss * 13 + lo) / 14.0
+        if self.avg_gain is not None:
+            if self.avg_loss == 0:
+                self.rsi = 100.0
+            else:
+                rs = self.avg_gain / self.avg_loss
+                self.rsi = 100.0 - 100.0 / (1.0 + rs)
+
     def on_batch(self, state, batch):
         for bar in batch["bars"]:
             if bar["symbol"] == SYMBOL:
                 self.closes.append(int(bar["c"]))
                 self.highs.append(int(bar["h"]))
+                self._feed_rsi()
         # Fold the fills of the orders decided on the previous batch: any
         # resolution (filled or rejected) clears the pending flag. A
         # rejected buy leaves no position, so the entry logic below may
@@ -129,7 +154,8 @@ class Bot:
         if i < self.p["min_bars"] or i - self.last_exit < self.p["cooldown"]:
             return None
         # Entry: a deep dip off the trailing 60-bar high, with a bounce
-        # already printing (this close above the previous close).
+        # already printing (this close above the previous close) and
+        # momentum genuinely oversold (RSI at or below RSI_MAX).
         win = self.highs[max(0, i - self.p["high_win"]):i]
         if not win:
             return None
@@ -138,6 +164,8 @@ class Bot:
             return None  # not dipped far enough below the trailing high
         if close <= self.closes[i - 1]:
             return None  # no bounce yet — the fall may still be accelerating
+        if self.rsi is None or self.rsi > self.p["rsi_max"]:
+            return None  # falling, but not washed out yet
         notional = state.cash * self.p["size_pct"] // 100
         room = state.weight_room(SYMBOL)
         if room < notional:

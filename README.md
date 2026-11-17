@@ -12,14 +12,15 @@ money, built for the make.fun bounty
 
 ## Strategy
 
-Long-only, selective deep-dip buying — no RSI, no divergence, no moving
-averages:
+Long-only, selective deep-dip buying with an RSI oversold gate (v2) —
+no divergence, no moving averages:
 
 - **Signal.** A buy is considered only when the latest close sits at least
   220 bps below the trailing 60-bar high of bar highs — a sharp one-hour
   washout, not a slow grind — AND the latest bar bounced (its close is above
   the previous close), so the fall is already exhausting instead of still
-  accelerating.
+  accelerating, AND Wilder RSI(14) at that bar is at or below 35, so the
+  washout's momentum is genuinely oversold rather than merely falling.
 - **Exit.** Sell everything when the close falls 60 bps below the entry
   bar's close (the bounce failed) or when 420 bars (7 hours) have passed
   since the entry bar (the bounce is given a fixed window, then banked).
@@ -40,14 +41,25 @@ against the bar's pool depth, positions flattened at the end:
 - 2 trades, 1 round trip (bars 564 -> 984)
 - Deterministic: two stdio runs produce byte-identical action logs
 
-The strategy was then re-validated on eight additional 24-hour windows of
-real BTC 1-minute data covering a −13.7% crash week. The same configuration
-is net-positive across all nine windows combined (dev +$14.65, other windows
-+$31 total, worst window −$9.49). Every trend, breakout, regime and
-short-horizon mean-reversion family tested lost money after costs on the dev
-window; looser dip thresholds and two-tier variants caught falling knives on
-crash days and were discarded. The parameters sit mid-plateau: dip 200–220
-bps, time stop 300–420 bars and stop 60–90 bps all score +$8 to +$15 on dev.
+The strategy was then re-validated on nine additional 24-hour windows of
+real BTC 1-minute data: the previous race kit's real pool tape of
+Nov 14–15 and eight Binance days (Nov 9–16) covering a −13.7% crash week.
+
+**v2 (this version)** adds exactly one thing to v1: the RSI(14) ≤ 35 entry
+gate. Measured on the official fill model across all ten windows, v1
+netted +$25.17 in total with a worst window of −$20.29; v2 nets **+$71.39**
+with the worst window at **−$9.49**, and the dev trade is untouched (still
++$14.65 — its entry RSI was already ≤ 35). On the Nov 14 pool tape, v1's
+two losing entries were taken while RSI was still above 35 — falling, but
+not yet washed out — and the gate filters exactly those, turning that
+window from −$20.29 into +$21.88. Neighbouring thresholds are weaker
+(RSI 32: +$45.35; RSI 38: +$29.22), and combining the gate with a wider
+stop destroys the gain (+$28.09), so v2 changes this one thing only. The
+sample is small (8 round trips); no edge is proven — this is the
+best-measured configuration, stated plainly. Every trend, breakout,
+regime and short-horizon mean-reversion family tested lost money after
+costs on these windows; looser dip thresholds and two-tier variants
+caught falling knives on crash days and were discarded.
 
 ## Layout
 
